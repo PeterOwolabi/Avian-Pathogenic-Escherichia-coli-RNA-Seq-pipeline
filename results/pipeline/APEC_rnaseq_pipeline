@@ -1,0 +1,174 @@
+# APEC Chicken RNA-Seq Pipeline — Code Only
+**Dataset:** GSE282645 | **Organism:** Gallus gallus | **Samples:** 10 (5 control, 5 infected)
+
+---
+
+## 1. Environment Setup
+
+```bash
+conda create -n rnaseq -c bioconda -c conda-forge \
+    fastqc trim-galore fastp hisat2 samtools subread -y
+
+conda activate rnaseq
+
+mkdir -p ~/rnaseq_project/{Raw_data,trimmed,QC_report,genome,Results,counts,Scripts}
+```
+
+---
+
+## 2. Local Pipeline
+
+```bash
+# Download data
+fasterq-dump SRR31454337 --split-files -O ~/rnaseq_project/Raw_data/
+
+# Quality control
+fastqc ~/rnaseq_project/Raw_data/SRR31454337_1.fastq \
+        ~/rnaseq_project/Raw_data/SRR31454337_2.fastq \
+        -o ~/rnaseq_project/QC_report/
+
+# Trimming
+fastp -i ~/rnaseq_project/Raw_data/SRR31454337_1.fastq \
+      -I ~/rnaseq_project/Raw_data/SRR31454337_2.fastq \
+      -o ~/rnaseq_project/trimmed/SRR31454337_1_trim.fastq \
+      -O ~/rnaseq_project/trimmed/SRR31454337_2_trim.fastq \
+      --html ~/rnaseq_project/QC_report/fastp_report.html \
+      --json ~/rnaseq_project/QC_report/fastp.json \
+      --thread 4 \
+      --qualified_quality_phred 20 \
+      --length_required 36
+
+# Download reference genome GTF
+wget -P ~/rnaseq_project/genome/ \
+https://ftp.ensembl.org/pub/release-112/gtf/gallus_gallus/Gallus_gallus.bGalGal1.mat.broiler.GRCg7b.112.gtf.gz
+
+# Build HISAT2 index
+hisat2-build ~/rnaseq_project/genome/chicken_genome.fna \
+             ~/rnaseq_project/genome/galgal_index
+
+# Alignment
+nohup hisat2 -x ~/rnaseq_project/genome/galgal_index \
+       -1 ~/rnaseq_project/trimmed/SRR31454337_1_trim.fastq \
+       -2 ~/rnaseq_project/trimmed/SRR31454337_2_trim.fastq \
+       -S ~/rnaseq_project/Results/SRR31454337.sam \
+       --summary-file ~/rnaseq_project/Results/alignment_summary.txt &
+
+# SAM to BAM
+samtools view -bS ~/rnaseq_project/Results/SRR31454337.sam | \
+samtools sort -o ~/rnaseq_project/Results/SRR31454337.bam
+samtools index ~/rnaseq_project/Results/SRR31454337.bam
+rm ~/rnaseq_project/Results/SRR31454337.sam
+
+# Read counting
+featureCounts -T 4 -p \
+              -a ~/rnaseq_project/genome/Gallus_gallus.bGalGal1.mat.broiler.GRCg7b.112.gtf.gz \
+              -o ~/rnaseq_project/counts/SRR31454337_counts.txt \
+              ~/rnaseq_project/Results/SRR31454337.bam
+```
+
+---
+
+## 3. R Analysis
+
+```r
+# Install packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install(c("DESeq2", "EnhancedVolcano", "pheatmap",
+                       "clusterProfiler", "org.Gg.eg.db"))
+install.packages(c("dplyr", "ggplot2"))
+
+# Load libraries
+library(dplyr)
+library(ggplot2)
+library(EnhancedVolcano)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Gg.eg.db)
+
+# Load DESeq2 results
+res <- read.table("C:/Users/PETER/Downloads/DESeq2_results.tabular",
+                  header = TRUE, sep = "\t")
+colnames(res) <- c("GeneID", "baseMean", "log2FoldChange",
+                   "lfcSE", "stat", "pvalue", "padj")
+
+# Filter DEGs
+sig_genes <- res %>%
+    filter(padj < 0.05, abs(log2FoldChange) > 1) %>%
+    arrange(padj)
+write.csv(sig_genes, "C:/Users/PETER/Desktop/significant_DEGs.csv", row.names = FALSE)
+
+# Load normalized counts
+norm_counts <- read.delim("C:/Users/PETER/Downloads/DESeq2_Normalized_counts.tabular",
+                          header = TRUE, row.names = 1)
+colnames(norm_counts) <- c(
+    "SRR31454341_Infected", "SRR31454342_Infected", "SRR31454343_Infected",
+    "SRR31454344_Infected", "SRR31454345_Infected", "SRR31454336_Control",
+    "SRR31454337_Control", "SRR31454338_Control", "SRR31454339_Control",
+    "SRR31454340_Control")
+
+condition <- c("Infected","Infected","Infected","Infected","Infected",
+               "Control","Control","Control","Control","Control")
+sample_annotation <- data.frame(condition = factor(condition),
+                                row.names = colnames(norm_counts))
+ann_colors <- list(condition = c(Control = "blue", Infected = "red"))
+
+# Volcano plot
+EnhancedVolcano(res,
+    lab = res$GeneID, x = "log2FoldChange", y = "padj",
+    title = "APEC Infected vs Non-infected",
+    subtitle = "Chicken Liver - Day 5 Post Inoculation",
+    pCutoff = 0.05, FCcutoff = 1, pointSize = 2, labSize = 3,
+    col = c("grey30", "forestgreen", "royalblue", "red2"))
+
+# Heatmap
+top50_genes <- head(sig_genes$GeneID, 50)
+mat <- norm_counts[top50_genes, ]
+mat_scaled <- t(scale(t(mat)))
+pheatmap(mat_scaled,
+         cluster_rows = TRUE, cluster_cols = TRUE, show_rownames = FALSE,
+         annotation_col = sample_annotation, annotation_colors = ann_colors,
+         main = "Top 50 DEGs - APEC Infected vs Control",
+         color = colorRampPalette(c("blue", "white", "red"))(100))
+
+# PCA plot
+pca_data <- prcomp(t(mat_scaled))
+pca_df <- data.frame(PC1 = pca_data$x[,1], PC2 = pca_data$x[,2],
+                     condition = sample_annotation$condition,
+                     sample = rownames(sample_annotation))
+ggplot(pca_df, aes(x = PC1, y = PC2, color = condition, label = sample)) +
+    geom_point(size = 4) +
+    geom_text(hjust = 0.5, vjust = -0.8, size = 3) +
+    theme_classic() +
+    scale_color_manual(values = c("Control" = "blue", "Infected" = "red")) +
+    ggtitle("PCA Plot - APEC Infected vs Control",
+            subtitle = "Chicken Liver - Day 5 Post Inoculation") +
+    xlab(paste0("PC1: ", round(summary(pca_data)$importance[2,1]*100), "% variance")) +
+    ylab(paste0("PC2: ", round(summary(pca_data)$importance[2,2]*100), "% variance"))
+ggsave("C:/Users/PETER/Desktop/PCA_plot.png", width = 10, height = 8, dpi = 300)
+
+# GO enrichment
+up_genes <- sig_genes %>% filter(log2FoldChange > 1) %>% pull(GeneID)
+down_genes <- sig_genes %>% filter(log2FoldChange < -1) %>% pull(GeneID)
+
+gene_entrez <- bitr(up_genes, fromType = "ENSEMBL",
+                    toType = "ENTREZID", OrgDb = org.Gg.eg.db)
+down_entrez <- bitr(down_genes, fromType = "ENSEMBL",
+                    toType = "ENTREZID", OrgDb = org.Gg.eg.db)
+
+go_up <- enrichGO(gene = gene_entrez$ENTREZID, OrgDb = org.Gg.eg.db,
+                  keyType = "ENTREZID", ont = "BP", pAdjustMethod = "BH",
+                  pvalueCutoff = 0.1, qvalueCutoff = 0.1,
+                  minGSSize = 3, maxGSSize = 500)
+barplot(go_up, showCategory = 7,
+        title = "GO Biological Process - Upregulated Genes", font.size = 12)
+
+go_down <- enrichGO(gene = down_entrez$ENTREZID, OrgDb = org.Gg.eg.db,
+                    keyType = "ENTREZID", ont = "ALL",
+                    pvalueCutoff = 1, qvalueCutoff = 1)
+dotplot(go_down, showCategory = 20,
+        title = "GO Enrichment - Downregulated Genes", font.size = 10)
+
+write.csv(as.data.frame(go_up), "C:/Users/PETER/Desktop/GO_upregulated.csv", row.names = FALSE)
+write.csv(as.data.frame(go_down), "C:/Users/PETER/Desktop/GO_downregulated.csv", row.names = FALSE)
+```
